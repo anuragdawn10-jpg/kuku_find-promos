@@ -1,23 +1,32 @@
 from __future__ import annotations
- 
+
 import json
 import os
 import tempfile
- 
+
 import pandas as pd
 import streamlit as st
- 
+
 from candidate_generator import generate_candidates
 from evaluator import quality_summary
 from parser import parse_zip
-from promo_scorer import groq_configured
 from ranker import rank_candidates
- 
- 
+
+
+def groq_configured() -> bool:
+    """True if GROQ_API_KEY is set in env vars or Streamlit secrets."""
+    if os.getenv("GROQ_API_KEY"):
+        return True
+    try:
+        return bool(st.secrets.get("GROQ_API_KEY"))
+    except Exception:
+        return False
+
+
 st.set_page_config(page_title="Kuku Promo Finder", page_icon="🎬", layout="wide")
 st.title("🎬 Kuku Promo Finder")
 st.caption("Screenplay-based promo discovery • 20–60 second clips")
- 
+
 with st.sidebar:
     st.header("Settings")
     key_ok = groq_configured()
@@ -44,7 +53,7 @@ with st.sidebar:
         "Promos to display", min_value=5, max_value=100, value=20, step=5
     )
     st.info("Heuristic scoring is a baseline. Review all suggested clips manually.")
- 
+
 uploaded = st.file_uploader("Upload the screenplay ZIP", type=["zip"])
 if uploaded:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
@@ -58,13 +67,13 @@ if uploaded:
         col1.metric("Episodes", len(episodes))
         col2.metric("Timestamped events", sum(len(e.events) for e in episodes))
         col3.metric("Episodes with events", sum(bool(e.events) for e in episodes))
- 
+
         if st.button("Find and rank promos", type="primary"):
             try:
                 with st.spinner("Generating promo windows..."):
                     candidates = generate_candidates(episodes)
                 st.session_state["candidate_count"] = len(candidates)
- 
+
                 if not candidates:
                     st.warning(
                         "No eligible 20–60 second promo windows were found. "
@@ -74,12 +83,12 @@ if uploaded:
                     st.session_state.pop("ranked", None)
                 else:
                     progress = st.progress(0.0, text="Scoring and ranking promos...")
- 
+
                     def _on_progress(done: int, total: int) -> None:
                         progress.progress(
                             done / total, text=f"Groq evaluated {done}/{total} windows"
                         )
- 
+
                     ranked = rank_candidates(
                         candidates,
                         use_llm=use_llm,
@@ -114,7 +123,7 @@ if uploaded:
             os.unlink(zip_path)
         except OSError:
             pass
- 
+
 if "ranked" in st.session_state:
     ranked = st.session_state["ranked"]
     st.subheader("Ranked promo candidates")
@@ -122,7 +131,7 @@ if "ranked" in st.session_state:
         f"{st.session_state.get('candidate_count', len(ranked))} windows generated; "
         f"showing top {len(ranked)}."
     )
- 
+
     st.json(quality_summary(ranked))
     rows = []
     for promo in ranked:
@@ -136,7 +145,7 @@ if "ranked" in st.session_state:
             "Method": promo["evaluation_method"],
         })
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
- 
+
     for promo in ranked:
         with st.expander(
             f"#{promo['rank']} • Episode {promo['episode']} • Score {promo['total_score']}"
@@ -152,7 +161,7 @@ if "ranked" in st.session_state:
             st.write(f"**Why it works:** {promo['why_it_works']}")
             st.write("**Scores:**", promo["scores"])
             st.write("**Review flags:**", promo.get("risk_flags", []))
- 
+
     st.download_button(
         "Download ranked_promos.json",
         json.dumps(ranked, indent=2, ensure_ascii=False),
@@ -171,4 +180,3 @@ else:
         "The app analyzes screenplay text and timestamps. It cannot verify actual "
         "video/audio quality."
     )
- 
