@@ -140,4 +140,4 @@ def build_transcript(events: list[dict]) -> str:
         end = event.get("end_label", "")
         text = str(event.get("text", "")).strip()
         lines.append(f"[{start}-{end}] {label}: {text}")
-    return "\n".join(lines)(lines)
+    return "\n".join(lines)
