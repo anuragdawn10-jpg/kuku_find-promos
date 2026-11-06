@@ -20,7 +20,6 @@ def _groq_api_key_configured() -> bool:
     try:
         return bool(st.secrets.get("GROQ_API_KEY"))
     except Exception:
-        # Streamlit secrets may not be configured in local development.
         return False
 
 
@@ -40,7 +39,16 @@ with st.sidebar:
         "Use Groq AI evaluation",
         value=False,
         disabled=not groq_ready,
-        help="Groq evaluates promo candidates and contributes to their ranking. If a request fails, heuristic scoring is used instead.",
+        help="All windows get quick heuristic scores; Groq is used only for the top candidates selected below.",
+    )
+    groq_limit = st.number_input(
+        "Number of top candidates to evaluate with Groq",
+        min_value=1,
+        max_value=20,
+        value=5,
+        step=1,
+        disabled=not use_llm,
+        help="Groq first evaluates the heuristic-ranked candidates, then the final list is re-ranked using the Groq scores.",
     )
     top_n = st.number_input(
         "Promos to display", min_value=5, max_value=100, value=20, step=5
@@ -62,19 +70,46 @@ if uploaded:
         col3.metric("Episodes with events", sum(bool(e.events) for e in episodes))
 
         if st.button("Find and rank promos", type="primary"):
-            with st.spinner(
-                "Generating candidates and evaluating with Groq..."
-                if use_llm
-                else "Generating candidates and evaluating them..."
-            ):
-                candidates = generate_candidates(episodes)
-                ranked = rank_candidates(
-                    candidates, use_llm=use_llm, top_n=int(top_n)
-                )
-            st.session_state["ranked"] = ranked
-            st.session_state["candidate_count"] = len(candidates)
-            st.session_state["episodes"] = len(episodes)
-            st.session_state["events"] = sum(len(e.events) for e in episodes)
+            try:
+                with st.spinner("Generating promo windows..."):
+                    candidates = generate_candidates(episodes)
+                st.session_state["candidate_count"] = len(candidates)
+
+                if not candidates:
+                    st.warning(
+                        "No eligible 20–60 second promo windows were found. "
+                        "Check that the scripts contain valid timestamps spanning "
+                        "at least 20 seconds."
+                    )
+                    st.session_state.pop("ranked", None)
+                else:
+                    progress = st.progress(0, text="Scoring candidate windows...")
+                    status = st.empty()
+
+                    def update_progress(done: int, total: int) -> None:
+                        progress.progress(
+                            done / total,
+                            text=f"Groq evaluation {done}/{total}",
+                        )
+                        status.caption(
+                            f"Evaluating {done} of {total} selected candidates with Groq."
+                        )
+
+                    with st.spinner("Ranking promos; Groq is called only for the selected top candidates..." if use_llm else "Scoring and ranking promos..."):
+                        ranked = rank_candidates(
+                            candidates,
+                            use_llm=use_llm,
+                            top_n=int(top_n),
+                            llm_limit=int(groq_limit),
+                            progress_callback=update_progress if use_llm else None,
+                        )
+                    progress.empty()
+                    status.empty()
+                    st.session_state["ranked"] = ranked
+                    st.session_state["episodes"] = len(episodes)
+                    st.session_state["events"] = sum(len(e.events) for e in episodes)
+            except Exception as exc:
+                st.error(f"Could not generate and rank promos: {exc}")
     except Exception as exc:
         st.error(f"Could not process ZIP: {exc}")
     finally:
@@ -87,13 +122,19 @@ if "ranked" in st.session_state:
     ranked = st.session_state["ranked"]
     st.subheader("Ranked promo candidates")
     st.caption(
-        f"{st.session_state['candidate_count']} windows generated; "
+        f"{st.session_state.get('candidate_count', len(ranked))} windows generated; "
         f"showing top {len(ranked)}."
     )
 
+    groq_count = sum(
+        str(promo.get("evaluation_method", "")).startswith("llm:")
+        for promo in ranked
+    )
     fallback_count = sum(
         promo.get("evaluation_method") == "heuristic_fallback" for promo in ranked
     )
+    if groq_count:
+        st.success(f"Groq successfully evaluated {groq_count} displayed promo(s).")
     if fallback_count:
         st.warning(
             f"Groq was unavailable for {fallback_count} displayed candidate(s); "
@@ -146,5 +187,5 @@ else:
     st.markdown("Upload the supplied ZIP, then select **Find and rank promos**.")
     st.warning(
         "The app analyzes screenplay text and timestamps. It cannot verify actual "
-        "video/audio quality. Enabling Groq sends screenplay excerpts to the Groq API."
+        "video/audio quality. Enabling Groq sends selected screenplay excerpts to the Groq API."
     )
