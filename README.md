@@ -5,7 +5,7 @@ A small, rerunnable prototype that parses timestamped screenplay text, generates
 ## Important assignment constraints
 
 - This repository implements **Problem 1: Find the Promos (Ads)**.
-- The supplied Kuku screenplay pack is confidential. The assignment says it is shared only for this assignment and must not be published or shared. **Do not commit the ZIP or extracted scripts to GitHub.** Keep the input locally.
+- The supplied Kuku screenplay pack is confidential. The assignment says it is shared only for this assignment and must not be published or shared. **Do not commit the ZIP or extracted scripts to GitHub.**
 - The application identifies moments and timestamps only. It does not edit video, add music/overlays, or verify actual footage/audio.
 - Heuristic scores are a baseline, not ground truth. Human/editor review is required.
 - The assignment asks for promos of 20–60 seconds, usually continuous but potentially composed of multiple segments. This first prototype generates continuous windows only.
@@ -63,14 +63,14 @@ The heuristic baseline works without a key. To use Groq:
 **Windows PowerShell**
 ```powershell
 $env:GROQ_API_KEY="your-key"
-$env:GROQ_MODEL="llama-3.3-70b-versatile"
+$env:GROQ_MODEL="openai/gpt-oss-120b"
 streamlit run app.py
 ```
 
 **macOS/Linux**
 ```bash
 export GROQ_API_KEY="your-key"
-export GROQ_MODEL="llama-3.3-70b-versatile"
+export GROQ_MODEL="openai/gpt-oss-120b"
 streamlit run app.py
 ```
 
@@ -80,7 +80,7 @@ In your app's **Settings → Secrets**, add:
 
 ```toml
 GROQ_API_KEY = "your-groq-api-key"
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "openai/gpt-oss-120b"
 ```
 
 Save the secrets and redeploy/restart the app. The evaluator reads credentials from Streamlit secrets or environment variables. Then enable **Use Groq LLM evaluation** in the sidebar. If the key is missing or a Groq request fails, the app continues with heuristic scoring. Do not commit `.streamlit/secrets.toml`, `.env`, or API keys.
