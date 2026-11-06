@@ -1,13 +1,13 @@
 """Rank candidates and use Groq on a bounded top subset."""
 from __future__ import annotations
-
+ 
 from collections.abc import Callable
-
+ 
 from promo_scorer import evaluate
-
+ 
 ProgressCallback = Callable[[int, int], None]
-
-
+ 
+ 
 def rank_candidates(
     candidates: list[dict],
     use_llm: bool = False,
@@ -17,7 +17,7 @@ def rank_candidates(
 ) -> list[dict]:
     """Score all eligible windows heuristically, then optionally call Groq only
     for the top ``llm_limit`` candidates from that initial ranking.
-
+ 
     This bounds network requests, so enabling Groq doesn't make one API call
     for every overlapping window. Groq-scored candidates are merged back into
     the ranking; all other candidates retain their heuristic evaluation.
@@ -26,7 +26,7 @@ def rank_candidates(
         candidate for candidate in candidates
         if 20 <= float(candidate["duration_seconds"]) <= 60
     ]
-
+ 
     ranked: list[dict] = []
     for candidate in eligible:
         result = evaluate(candidate, use_llm=False)
@@ -38,9 +38,9 @@ def rank_candidates(
         item["candidate_id"] = candidate["candidate_id"]
         item["duration_seconds"] = float(candidate["duration_seconds"])
         ranked.append(item)
-
+ 
     ranked.sort(key=lambda item: item["total_score"], reverse=True)
-
+ 
     if use_llm and ranked:
         count = max(0, min(int(llm_limit), len(ranked)))
         selected = ranked[:count]
@@ -51,9 +51,19 @@ def rank_candidates(
             item.update(evaluate(candidate_by_id[item["candidate_id"]], use_llm=True))
             if progress_callback is not None:
                 progress_callback(index, total)
-
-    ranked.sort(key=lambda item: item["total_score"], reverse=True)
+ 
+    # Groq-scored items are ranked first: LLM and heuristic scores are on
+    # different scales (the LLM is deliberately conservative), so mixing them
+    # in one sort would push the clips Groq reviewed below unreviewed ones.
+    ranked.sort(
+        key=lambda item: (
+            str(item.get("evaluation_method", "")).startswith("llm:"),
+            item["total_score"],
+        ),
+        reverse=True,
+    )
     for index, item in enumerate(ranked, start=1):
         item["rank"] = index
-
+ 
     return ranked[:top_n] if top_n else ranked
+ 
