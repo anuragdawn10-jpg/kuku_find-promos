@@ -13,14 +13,20 @@ from parser import parse_zip
 from ranker import rank_candidates
 
 
-def _groq_api_key_configured() -> bool:
-    """Check whether Groq credentials are available without displaying them."""
-    if os.getenv("GROQ_API_KEY"):
-        return True
+def _groq_setting(name: str, default: str | None = None) -> str | None:
+    """Read a Groq setting from environment variables or Streamlit secrets."""
+    value = os.getenv(name)
+    if value:
+        return value.strip()
     try:
-        return bool(st.secrets.get("GROQ_API_KEY"))
+        secret_value = st.secrets.get(name, default)
+        return str(secret_value).strip() if secret_value else default
     except Exception:
-        return False
+        return default
+
+
+def _groq_api_key_configured() -> bool:
+    return bool(_groq_setting("GROQ_API_KEY"))
 
 
 st.set_page_config(page_title="Kuku Promo Finder", page_icon="🎬", layout="wide")
@@ -34,6 +40,25 @@ with st.sidebar:
         st.success("Groq API key configured")
     else:
         st.info("Groq is optional. Add GROQ_API_KEY in Streamlit Cloud → Settings → Secrets to enable it.")
+
+    if st.button("Test Groq connection", disabled=not groq_ready):
+        try:
+            from groq import Groq
+
+            model = _groq_setting("GROQ_MODEL", "llama-3.3-70b-versatile")
+            client = Groq(api_key=_groq_setting("GROQ_API_KEY"), timeout=20.0, max_retries=0)
+            client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "Reply with OK."}],
+                max_tokens=5,
+                temperature=0,
+            )
+            st.success(f"Groq connection succeeded using model {model}.")
+        except Exception as exc:
+            # Never display or log the secret itself; expose only the SDK error
+            # so the app owner can distinguish authentication, model, quota,
+            # and network issues.
+            st.error(f"Groq connection test failed ({type(exc).__name__}): {exc}")
 
     use_llm = st.checkbox(
         "Use Groq AI evaluation",
@@ -87,15 +112,15 @@ if uploaded:
                     status = st.empty()
 
                     def update_progress(done: int, total: int) -> None:
-                        progress.progress(
-                            done / total,
-                            text=f"Groq evaluation {done}/{total}",
-                        )
+                        progress.progress(done / total, text=f"Groq evaluation {done}/{total}")
                         status.caption(
                             f"Evaluating {done} of {total} selected candidates with Groq."
                         )
 
-                    with st.spinner("Ranking promos; Groq is called only for the selected top candidates..." if use_llm else "Scoring and ranking promos..."):
+                    with st.spinner(
+                        "Ranking promos; Groq is called only for the selected top candidates..."
+                        if use_llm else "Scoring and ranking promos..."
+                    ):
                         ranked = rank_candidates(
                             candidates,
                             use_llm=use_llm,
@@ -130,16 +155,20 @@ if "ranked" in st.session_state:
         str(promo.get("evaluation_method", "")).startswith("llm:")
         for promo in ranked
     )
-    fallback_count = sum(
-        promo.get("evaluation_method") == "heuristic_fallback" for promo in ranked
-    )
+    fallback_items = [
+        promo for promo in ranked
+        if promo.get("evaluation_method") == "heuristic_fallback"
+    ]
     if groq_count:
         st.success(f"Groq successfully evaluated {groq_count} displayed promo(s).")
-    if fallback_count:
+    if fallback_items:
         st.warning(
-            f"Groq was unavailable for {fallback_count} displayed candidate(s); "
-            "heuristic fallback scores were used. See review flags below."
+            f"Groq was unavailable for {len(fallback_items)} displayed candidate(s). "
+            "The failure reason is listed here and in each candidate's review flags."
         )
+        for promo in fallback_items:
+            reason = "; ".join(promo.get("risk_flags", []))
+            st.error(f"Episode {promo['episode']} ({promo['candidate_id']}): {reason}")
 
     st.json(quality_summary(ranked))
     rows = []
