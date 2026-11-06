@@ -1,248 +1,208 @@
-"""Heuristic baseline scorer and optional Groq LLM evaluator.
-
-The heuristic is a reproducible baseline, not a substitute for editor review.
-Set GROQ_API_KEY and optionally GROQ_MODEL to enable LLM-assisted evaluation.
-"""
+"""Parser for timestamped screenplay text files."""
 from __future__ import annotations
 
-import json
-import os
+from dataclasses import asdict, dataclass
+from pathlib import Path
+import re
+import zipfile
 
 
-def _config_value(name: str, default: str | None = None) -> str | None:
-    """Read configuration from environment variables or Streamlit secrets."""
-    value = os.getenv(name)
-    if value:
-        return value
-
-    try:
-        import streamlit as st
-        return st.secrets.get(name, default)
-    except Exception:
-        # Streamlit secrets may be unavailable when running locally without a
-        # secrets file, or when this module is used outside the Streamlit app.
-        return default
+TIME_RE = re.compile(r"(\d{2,}):(\d{2})\.(\d{2})")
+TIMESTAMP_LINE_RE = re.compile(
+    r"Start:\s*\((\d{2,}:\d{2}\.\d{2})\)\s*\|\s*"
+    r"End:\s*\((\d{2,}:\d{2}\.\d{2})\)",
+    re.IGNORECASE,
+)
+EP_RE = re.compile(r"EPISODE NUMBER:\s*(?:Episode\s*)?(\d+)", re.IGNORECASE)
+LOG_RE = re.compile(r"EPISODE LOGLINE:\s*(.*)", re.IGNORECASE)
+CONT_RE = re.compile(r"CONTINUITY NOTES:\s*(.*)", re.IGNORECASE)
+SCENE_RE = re.compile(r"^SCENE\s+(\d+)\b", re.IGNORECASE)
 
 
-WEIGHTS = {
-    "hook": 0.25,
-    "cliffhanger": 0.25,
-    "emotion": 0.20,
-    "standalone": 0.20,
-    "coherence": 0.10,
-}
-
-HOOK_TERMS = [
-    "what", "why", "no", "never", "stop", "don't", "you should",
-    "look", "wait", "because", "marrying", "betray", "secret",
-]
-CLIFF_TERMS = [
-    "will you", "accept", "who are you", "what happened", "please",
-    "i swear", "you don't know", "the truth", "marry", "choose",
-]
-EMOTION_TERMS = [
-    "cry", "tears", "heartbroken", "shocked", "furious", "love",
-    "hate", "betray", "desperate", "screaming", "begging",
-]
+@dataclass
+class Event:
+    episode: int
+    scene: int | None
+    kind: str
+    speaker: str
+    start: float
+    end: float
+    text: str
+    start_label: str
+    end_label: str
 
 
-def _hits(text: str, terms: list[str]) -> int:
-    text_lower = text.lower()
-    return sum(1 for term in terms if term in text_lower)
+@dataclass
+class Episode:
+    episode: int
+    filename: str
+    logline: str
+    continuity: str
+    events: list[Event]
 
 
-def _event_text(events: list, predicate=None) -> str:
-    parts = []
-    for event in events:
-        if not isinstance(event, dict):
+def to_seconds(label: str) -> float:
+    """Convert a MM:SS.cc timestamp to seconds."""
+    match = TIME_RE.fullmatch(label.strip())
+    if not match:
+        raise ValueError(f"Invalid timestamp: {label}")
+
+    minutes, seconds, centiseconds = map(int, match.groups())
+    if seconds >= 60 or centiseconds >= 100:
+        raise ValueError(f"Invalid timestamp: {label}")
+
+    return minutes * 60 + seconds + centiseconds / 100
+
+
+def _header_value(pattern: re.Pattern, text: str) -> str:
+    match = pattern.search(text)
+    return match.group(1).strip() if match else ""
+
+
+def _classify_heading(heading: str) -> tuple[str, str]:
+    heading = heading.strip().strip("*").strip().rstrip(":").strip()
+    upper_heading = heading.upper()
+
+    for label, kind in (
+        ("CAMERA", "camera"),
+        ("ACTION", "action"),
+        ("SOUND", "sound"),
+    ):
+        if upper_heading.startswith(label):
+            return kind, ""
+
+    if heading:
+        speaker = re.sub(r"\s*\([^)]*\)", "", heading).strip()
+        return "dialogue", speaker
+
+    return "other", ""
+
+
+def _find_heading(lines: list[str], event_line: int) -> str:
+    """Find a nearby category/speaker heading above a timestamp."""
+    for index in range(event_line - 1, max(-1, event_line - 6), -1):
+        candidate = lines[index].strip()
+        if not candidate:
             continue
-        if predicate is not None and not predicate(event):
+
+        if candidate.startswith("**") and candidate.endswith("**"):
+            return candidate
+
+        if re.match(r"^[A-Z][A-Z0-9 '’.-]*(?:\s*\([^)]*\))?:$", candidate):
+            return candidate
+
+        # Don't accidentally use a prior event's heading.
+        if TIMESTAMP_LINE_RE.search(candidate):
+            break
+
+    return ""
+
+
+def parse_script(text: str, filename: str = "unknown.txt") -> Episode:
+    """Parse episode metadata and timestamped screenplay events."""
+    if not isinstance(text, str):
+        raise TypeError("Screenplay text must be a string.")
+
+    episode_match = EP_RE.search(text)
+    if episode_match:
+        episode_number = int(episode_match.group(1))
+    else:
+        filename_match = re.search(r"episode-(\d+)", filename, re.IGNORECASE)
+        if not filename_match:
+            raise ValueError(f"Could not identify episode number in {filename}")
+        episode_number = int(filename_match.group(1))
+
+    logline = _header_value(LOG_RE, text)
+    continuity = _header_value(CONT_RE, text)
+    lines = text.splitlines()
+    events = []
+    current_scene = None
+    index = 0
+
+    while index < len(lines):
+        scene_match = SCENE_RE.match(lines[index].strip())
+        if scene_match:
+            current_scene = int(scene_match.group(1))
+
+        timestamp_match = TIMESTAMP_LINE_RE.search(lines[index])
+        if not timestamp_match:
+            index += 1
             continue
-        text = event.get("text")
-        if text:
-            parts.append(str(text))
-    return " ".join(parts)
 
+        start_label, end_label = timestamp_match.groups()
+        body_lines = []
+        body_index = index + 1
 
-def _number(value, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+        # Capture the event body up to a blank line or the next event block.
+        while body_index < len(lines):
+            line = lines[body_index]
+            if not line.strip() or TIMESTAMP_LINE_RE.search(line):
+                break
+            body_lines.append(line.strip())
+            body_index += 1
 
+        body = " ".join(line for line in body_lines if line).strip()
+        heading = _find_heading(lines, index)
+        kind, speaker = _classify_heading(heading)
 
-def heuristic_evaluate(candidate: dict) -> dict:
-    """Score a candidate using deterministic keyword and structure signals."""
-    events = candidate.get("events") or []
-    if not isinstance(events, list):
-        events = []
+        if body:
+            try:
+                start_seconds = to_seconds(start_label)
+                end_seconds = to_seconds(end_label)
+            except ValueError:
+                start_seconds = end_seconds = -1
 
-    segments = candidate.get("segments") or []
-    first_segment = segments[0] if segments and isinstance(segments[0], dict) else {}
-    segment_start = _number(first_segment.get("start_seconds"))
-    segment_end = _number(first_segment.get("end_seconds"))
-    duration = _number(candidate.get("duration_seconds"))
+            if start_seconds >= 0 and end_seconds >= start_seconds:
+                events.append(Event(
+                    episode=episode_number,
+                    scene=current_scene,
+                    kind=kind,
+                    speaker=speaker,
+                    start=start_seconds,
+                    end=end_seconds,
+                    text=body,
+                    start_label=start_label,
+                    end_label=end_label,
+                ))
 
-    first_three = [
-        event for event in events
-        if isinstance(event, dict)
-        and _number(event.get("start"), float("inf")) < segment_start + 3
-        and _number(event.get("end"), float("-inf")) > segment_start
-    ]
-    last_five_start = segment_end - 5
-    last_five = [
-        event for event in events
-        if isinstance(event, dict)
-        and _number(event.get("end"), float("-inf")) > last_five_start
-        and _number(event.get("start"), float("inf")) < segment_end
-    ]
+        # If the next block immediately follows this one, process it next.
+        index = body_index if body_index > index + 1 else index + 1
 
-    hook_text = _event_text(first_three)
-    ending_text = _event_text(last_five)
-    transcript = str(candidate.get("transcript") or _event_text(events))
-
-    hook_score = min(10, 3 + 1.5 * _hits(hook_text, HOOK_TERMS)
-                     + (2 if first_three else 0))
-    cliffhanger_score = min(
-        10,
-        2 + 1.6 * _hits(ending_text, CLIFF_TERMS)
-        + (2 if "?" in ending_text else 0),
-    )
-    emotion_score = min(10, 2 + 1.4 * _hits(transcript, EMOTION_TERMS))
-    dialogue_count = sum(
-        1 for event in events
-        if isinstance(event, dict) and event.get("kind") == "dialogue"
-    )
-    standalone_score = min(
-        10,
-        4 + (2 if candidate.get("logline") else 0)
-        + (2 if dialogue_count >= 3 else 0),
-    )
-    coherence_score = min(
-        10,
-        4 + (2 if events else 0) + (2 if duration >= 25 else 0),
+    events.sort(key=lambda event: (event.start, event.end, event.kind))
+    return Episode(
+        episode=episode_number,
+        filename=Path(filename).name,
+        logline=logline,
+        continuity=continuity,
+        events=events,
     )
 
-    scores = {
-        "hook": round(hook_score, 1),
-        "cliffhanger": round(cliffhanger_score, 1),
-        "emotion": round(emotion_score, 1),
-        "standalone": round(standalone_score, 1),
-        "coherence": round(coherence_score, 1),
-    }
-    total_score = round(
-        sum(scores[key] * WEIGHTS[key] for key in WEIGHTS),
-        2,
-    )
 
+def parse_zip(zip_path: str | Path) -> list[Episode]:
+    """Parse all .txt screenplay files in a ZIP archive."""
+    episodes = []
+
+    with zipfile.ZipFile(zip_path) as archive:
+        names = sorted(
+            name for name in archive.namelist()
+            if name.lower().endswith(".txt") and not name.endswith("/")
+        )
+        if not names:
+            raise ValueError("ZIP contains no .txt screenplay files.")
+
+        for name in names:
+            raw_text = archive.read(name).decode("utf-8", errors="replace")
+            episodes.append(parse_script(raw_text, name))
+
+    return sorted(episodes, key=lambda episode: episode.episode)
+
+
+def episode_to_dict(ep: Episode) -> dict:
+    """Serialize an episode and its events into plain Python dictionaries."""
     return {
-        "scores": scores,
-        "total_score": total_score,
-        "evaluation_method": "heuristic",
-        "hook": hook_text[:300] or "No dialogue/action detected in first 3 seconds.",
-        "cliffhanger": ending_text[:300] or "No clear ending event detected.",
-        "why_it_works": (
-            "Baseline keyword and structure score; editor review required."
-        ),
-        "risk_flags": [
-            "Heuristic scores may overrate keyword matches."
-        ],
+        "episode": ep.episode,
+        "filename": ep.filename,
+        "logline": ep.logline,
+        "continuity": ep.continuity,
+        "events": [asdict(event) for event in ep.events],
     }
-
-
-def _normalize_llm_result(result: dict, model: str) -> dict:
-    if not isinstance(result, dict):
-        raise ValueError("LLM response must be a JSON object.")
-
-    raw_scores = result.get("scores")
-    if not isinstance(raw_scores, dict):
-        raise ValueError("LLM response is missing a scores object.")
-
-    scores = {}
-    for key in WEIGHTS:
-        try:
-            score = float(raw_scores.get(key, 0))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"LLM returned an invalid {key} score.") from exc
-        if not 0 <= score <= 10:
-            raise ValueError(f"LLM {key} score must be between 0 and 10.")
-        scores[key] = score
-
-    risk_flags = result.get("risk_flags", [])
-    if not isinstance(risk_flags, list):
-        risk_flags = [str(risk_flags)]
-
-    normalized = dict(result)
-    normalized.update({
-        "scores": scores,
-        "total_score": round(
-            sum(scores[key] * WEIGHTS[key] for key in WEIGHTS),
-            2,
-        ),
-        "evaluation_method": f"llm:{model}",
-        "hook": str(result.get("hook", "")),
-        "cliffhanger": str(result.get("cliffhanger", "")),
-        "why_it_works": str(result.get("why_it_works", "")),
-        "risk_flags": [str(flag) for flag in risk_flags],
-    })
-    return normalized
-
-
-def llm_evaluate(candidate: dict, model: str | None = None) -> dict:
-    """Evaluate a candidate with Groq, when credentials and package exist."""
-    api_key = _config_value("GROQ_API_KEY")
-    if not api_key:
-        raise RuntimeError("GROQ_API_KEY is not configured.")
-
-    try:
-        from groq import Groq
-    except ImportError as exc:
-        raise RuntimeError("Install the optional groq package.") from exc
-
-    model = model or _config_value("GROQ_MODEL", "llama-3.3-70b-versatile")
-    prompt = f"""Evaluate this screenplay excerpt as a standalone social-media promo.
-Only use evidence in the excerpt. Do not invent events or dialogue.
-A valid promo is 20–60 seconds, starts with a compelling hook in its first 3 seconds,
-ends at an unresolved cliffhanger, and makes sense to a first-time viewer.
-Return ONLY valid JSON with keys: scores (hook, cliffhanger, emotion, standalone,
-coherence; each number from 0 to 10), hook (brief evidence/description),
-cliffhanger (brief evidence/description), why_it_works (one sentence),
-risk_flags (array of strings). Be conservative and flag missing context.
-Episode: {candidate.get('episode', 'unknown')}
-Logline: {candidate.get('logline', '')}
-Clip: {candidate.get('segments', [])}
-Transcript:
-{str(candidate.get('transcript', ''))[:12000]}
-"""
-
-    response = Groq(api_key=api_key).chat.completions.create(
-        model=model,
-        temperature=0.1,
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"},
-    )
-    content = response.choices[0].message.content
-    if not content:
-        raise ValueError("LLM returned an empty response.")
-
-    return _normalize_llm_result(json.loads(content), model)
-
-
-def evaluate(candidate: dict, use_llm: bool = False) -> dict:
-    """Evaluate a candidate, using the heuristic as a safe fallback."""
-    if not isinstance(candidate, dict):
-        raise TypeError("Candidate must be a dictionary.")
-
-    if use_llm:
-        try:
-            return llm_evaluate(candidate)
-        except Exception as exc:
-            result = heuristic_evaluate(candidate)
-            result["risk_flags"].append(
-                f"LLM unavailable; heuristic fallback used: {exc}"
-            )
-            result["evaluation_method"] = "heuristic_fallback"
-            return result
-
-    return heuristic_evaluate(candidate)
-
