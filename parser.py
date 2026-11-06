@@ -1,19 +1,23 @@
-"""Parser for Kuku's timestamped screenplay text files."""
+"""Parser for timestamped screenplay text files."""
 from __future__ import annotations
-from dataclasses import dataclass, asdict
+
+from dataclasses import asdict, dataclass
 from pathlib import Path
 import re
 import zipfile
 
-TIME_RE = re.compile(r"(\d{2}):(\d{2})\.(\d{2})")
-EVENT_RE = re.compile(
-    r"Start:\s*\((\d{2}:\d{2}\.\d{2})\)\s*\|\s*End:\s*\((\d{2}:\d{2}\.\d{2})\)\s*\n(.*?)(?=\n\n|\Z)",
-    re.S,
+
+TIME_RE = re.compile(r"(\d{2,}):(\d{2})\.(\d{2})")
+TIMESTAMP_LINE_RE = re.compile(
+    r"Start:\s*\((\d{2,}:\d{2}\.\d{2})\)\s*\|\s*"
+    r"End:\s*\((\d{2,}:\d{2}\.\d{2})\)",
+    re.IGNORECASE,
 )
-EP_RE = re.compile(r"EPISODE NUMBER:\s*Episode\s+(\d+)", re.I)
-LOG_RE = re.compile(r"EPISODE LOGLINE:\s*(.*)", re.I)
-CONT_RE = re.compile(r"CONTINUITY NOTES:\s*(.*)", re.I)
-SCENE_RE = re.compile(r"^SCENE\s+(\d+)", re.M)
+EP_RE = re.compile(r"EPISODE NUMBER:\s*(?:Episode\s*)?(\d+)", re.IGNORECASE)
+LOG_RE = re.compile(r"EPISODE LOGLINE:\s*(.*)", re.IGNORECASE)
+CONT_RE = re.compile(r"CONTINUITY NOTES:\s*(.*)", re.IGNORECASE)
+SCENE_RE = re.compile(r"^SCENE\s+(\d+)\b", re.IGNORECASE)
+
 
 @dataclass
 class Event:
@@ -27,6 +31,7 @@ class Event:
     start_label: str
     end_label: str
 
+
 @dataclass
 class Episode:
     episode: int
@@ -35,95 +40,169 @@ class Episode:
     continuity: str
     events: list[Event]
 
+
 def to_seconds(label: str) -> float:
-    m = TIME_RE.fullmatch(label.strip())
-    if not m:
+    """Convert a MM:SS.cc timestamp to seconds."""
+    match = TIME_RE.fullmatch(label.strip())
+    if not match:
         raise ValueError(f"Invalid timestamp: {label}")
-    minutes, seconds, centiseconds = map(int, m.groups())
+
+    minutes, seconds, centiseconds = map(int, match.groups())
+    if seconds >= 60 or centiseconds >= 100:
+        raise ValueError(f"Invalid timestamp: {label}")
+
     return minutes * 60 + seconds + centiseconds / 100
 
+
+def _header_value(pattern: re.Pattern, text: str) -> str:
+    match = pattern.search(text)
+    return match.group(1).strip() if match else ""
+
+
+def _classify_heading(heading: str) -> tuple[str, str]:
+    heading = heading.strip().strip("*").strip().rstrip(":").strip()
+    upper_heading = heading.upper()
+
+    for label, kind in (
+        ("CAMERA", "camera"),
+        ("ACTION", "action"),
+        ("SOUND", "sound"),
+    ):
+        if upper_heading.startswith(label):
+            return kind, ""
+
+    if heading:
+        speaker = re.sub(r"\s*\([^)]*\)", "", heading).strip()
+        return "dialogue", speaker
+
+    return "other", ""
+
+
+def _find_heading(lines: list[str], event_line: int) -> str:
+    """Find a nearby category/speaker heading above a timestamp."""
+    for index in range(event_line - 1, max(-1, event_line - 6), -1):
+        candidate = lines[index].strip()
+        if not candidate:
+            continue
+
+        if candidate.startswith("**") and candidate.endswith("**"):
+            return candidate
+
+        if re.match(r"^[A-Z][A-Z0-9 '’.-]*(?:\s*\([^)]*\))?:$", candidate):
+            return candidate
+
+        # Don't accidentally use a prior event's heading.
+        if TIMESTAMP_LINE_RE.search(candidate):
+            break
+
+    return ""
+
+
 def parse_script(text: str, filename: str = "unknown.txt") -> Episode:
-    ep_match = EP_RE.search(text)
-    if not ep_match:
-        # Filename convention: episode-001-...
-        name_match = re.search(r"episode-(\d+)", filename, re.I)
-        if not name_match:
-            raise ValueError(f"Could not identify episode number in {filename}")
-        episode_no = int(name_match.group(1))
+    """Parse episode metadata and timestamped screenplay events."""
+    if not isinstance(text, str):
+        raise TypeError("Screenplay text must be a string.")
+
+    episode_match = EP_RE.search(text)
+    if episode_match:
+        episode_number = int(episode_match.group(1))
     else:
-        episode_no = int(ep_match.group(1))
+        filename_match = re.search(r"episode-(\d+)", filename, re.IGNORECASE)
+        if not filename_match:
+            raise ValueError(f"Could not identify episode number in {filename}")
+        episode_number = int(filename_match.group(1))
 
-    logline = (LOG_RE.search(text).group(1).strip()
-               if LOG_RE.search(text) else "")
-    continuity = (CONT_RE.search(text).group(1).strip()
-                  if CONT_RE.search(text) else "")
-
-    events: list[Event] = []
-    current_scene = None
+    logline = _header_value(LOG_RE, text)
+    continuity = _header_value(CONT_RE, text)
     lines = text.splitlines()
-    # Parse blocks after Start/End lines; capture until the next blank line.
-    i = 0
-    while i < len(lines):
-        scene_match = re.match(r"SCENE\s+(\d+)", lines[i].strip())
+    events = []
+    current_scene = None
+    index = 0
+
+    while index < len(lines):
+        scene_match = SCENE_RE.match(lines[index].strip())
         if scene_match:
             current_scene = int(scene_match.group(1))
-        m = re.search(r"Start:\s*\((\d{2}:\d{2}\.\d{2})\)\s*\|\s*End:\s*\((\d{2}:\d{2}\.\d{2})\)", lines[i])
-        if m:
-            start_label, end_label = m.groups()
-            body_lines = []
-            j = i + 1
-            while j < len(lines) and lines[j].strip():
-                body_lines.append(lines[j].strip())
-                j += 1
-            body = " ".join(body_lines).strip()
-            # Find the nearest preceding category/speaker heading.
-            heading = ""
-            for k in range(i - 1, max(-1, i - 5), -1):
-                candidate = lines[k].strip()
-                if candidate.startswith("**") and candidate.endswith("**"):
-                    heading = candidate.strip("*").strip()
-                    break
-                if re.match(r"^[A-Z][A-Z0-9 '’.-]+(?:\s*\([^)]*\))?:$", candidate):
-                    heading = candidate.rstrip(":")
-                    break
-            if heading.upper().startswith("CAMERA"):
-                kind, speaker = "camera", ""
-            elif heading.upper().startswith("ACTION"):
-                kind, speaker = "action", ""
-            elif heading.upper().startswith("SOUND"):
-                kind, speaker = "sound", ""
-            elif heading:
-                kind, speaker = "dialogue", re.sub(r"\s*\([^)]*\)", "", heading).strip()
-            else:
-                kind, speaker = "other", ""
-            if body:
-                try:
-                    start_s, end_s = to_seconds(start_label), to_seconds(end_label)
-                    if end_s >= start_s:
-                        events.append(Event(episode_no, current_scene, kind, speaker,
-                                            start_s, end_s, body, start_label, end_label))
-                except ValueError:
-                    pass
-            i = j
-        else:
-            i += 1
-    events.sort(key=lambda e: (e.start, e.end, e.kind))
-    return Episode(episode_no, Path(filename).name, logline, continuity, events)
+
+        timestamp_match = TIMESTAMP_LINE_RE.search(lines[index])
+        if not timestamp_match:
+            index += 1
+            continue
+
+        start_label, end_label = timestamp_match.groups()
+        body_lines = []
+        body_index = index + 1
+
+        # Capture the event body up to a blank line or the next event block.
+        while body_index < len(lines):
+            line = lines[body_index]
+            if not line.strip() or TIMESTAMP_LINE_RE.search(line):
+                break
+            body_lines.append(line.strip())
+            body_index += 1
+
+        body = " ".join(line for line in body_lines if line).strip()
+        heading = _find_heading(lines, index)
+        kind, speaker = _classify_heading(heading)
+
+        if body:
+            try:
+                start_seconds = to_seconds(start_label)
+                end_seconds = to_seconds(end_label)
+            except ValueError:
+                start_seconds = end_seconds = -1
+
+            if start_seconds >= 0 and end_seconds >= start_seconds:
+                events.append(Event(
+                    episode=episode_number,
+                    scene=current_scene,
+                    kind=kind,
+                    speaker=speaker,
+                    start=start_seconds,
+                    end=end_seconds,
+                    text=body,
+                    start_label=start_label,
+                    end_label=end_label,
+                ))
+
+        # If the next block immediately follows this one, process it next.
+        index = body_index if body_index > index + 1 else index + 1
+
+    events.sort(key=lambda event: (event.start, event.end, event.kind))
+    return Episode(
+        episode=episode_number,
+        filename=Path(filename).name,
+        logline=logline,
+        continuity=continuity,
+        events=events,
+    )
+
 
 def parse_zip(zip_path: str | Path) -> list[Episode]:
+    """Parse all .txt screenplay files in a ZIP archive."""
     episodes = []
-    with zipfile.ZipFile(zip_path) as zf:
-        names = sorted(n for n in zf.namelist() if n.lower().endswith(".txt"))
+
+    with zipfile.ZipFile(zip_path) as archive:
+        names = sorted(
+            name for name in archive.namelist()
+            if name.lower().endswith(".txt") and not name.endswith("/")
+        )
         if not names:
             raise ValueError("ZIP contains no .txt screenplay files.")
+
         for name in names:
-            raw = zf.read(name).decode("utf-8", errors="replace")
-            episodes.append(parse_script(raw, name))
-    return sorted(episodes, key=lambda e: e.episode)
+            raw_text = archive.read(name).decode("utf-8", errors="replace")
+            episodes.append(parse_script(raw_text, name))
+
+    return sorted(episodes, key=lambda episode: episode.episode)
+
 
 def episode_to_dict(ep: Episode) -> dict:
+    """Serialize an episode and its events into plain Python dictionaries."""
     return {
-        "episode": ep.episode, "filename": ep.filename,
-        "logline": ep.logline, "continuity": ep.continuity,
-        "events": [asdict(e) for e in ep.events]
+        "episode": ep.episode,
+        "filename": ep.filename,
+        "logline": ep.logline,
+        "continuity": ep.continuity,
+        "events": [asdict(event) for event in ep.events],
     }
