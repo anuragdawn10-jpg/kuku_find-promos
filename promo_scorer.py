@@ -1,26 +1,31 @@
 """Heuristic baseline scorer and optional Groq LLM evaluator.
-
+ 
 The heuristic is a reproducible baseline, not a substitute for editor review.
 Set GROQ_API_KEY and optionally GROQ_MODEL to enable LLM-assisted evaluation.
 """
 from __future__ import annotations
-
+ 
 import json
 import os
-
-
+ 
+ 
 def _config_value(name: str, default: str | None = None) -> str | None:
     value = os.getenv(name)
     if value:
         return value
-
+ 
     try:
         import streamlit as st
         return st.secrets.get(name, default)
     except Exception:
         return default
-
-
+ 
+ 
+def groq_configured() -> bool:
+    """True when a Groq API key is available from env vars or Streamlit secrets."""
+    return bool(_config_value("GROQ_API_KEY"))
+ 
+ 
 WEIGHTS = {
     "hook": 0.25,
     "cliffhanger": 0.25,
@@ -28,7 +33,7 @@ WEIGHTS = {
     "standalone": 0.20,
     "coherence": 0.10,
 }
-
+ 
 HOOK_TERMS = [
     "what", "why", "no", "never", "stop", "don't", "you should",
     "look", "wait", "because", "marrying", "betray", "secret",
@@ -41,13 +46,13 @@ EMOTION_TERMS = [
     "cry", "tears", "heartbroken", "shocked", "furious", "love",
     "hate", "betray", "desperate", "screaming", "begging",
 ]
-
-
+ 
+ 
 def _hits(text: str, terms: list[str]) -> int:
     text_lower = text.lower()
     return sum(1 for term in terms if term in text_lower)
-
-
+ 
+ 
 def _event_text(events: list, predicate=None) -> str:
     parts = []
     for event in events:
@@ -59,27 +64,27 @@ def _event_text(events: list, predicate=None) -> str:
         if text:
             parts.append(str(text))
     return " ".join(parts)
-
-
+ 
+ 
 def _number(value, default: float = 0.0) -> float:
     try:
         return float(value)
     except (TypeError, ValueError):
         return default
-
-
+ 
+ 
 def heuristic_evaluate(candidate: dict) -> dict:
     """Score a candidate using deterministic keyword and structure signals."""
     events = candidate.get("events") or []
     if not isinstance(events, list):
         events = []
-
+ 
     segments = candidate.get("segments") or []
     first_segment = segments[0] if segments and isinstance(segments[0], dict) else {}
     segment_start = _number(first_segment.get("start_seconds"))
     segment_end = _number(first_segment.get("end_seconds"))
     duration = _number(candidate.get("duration_seconds"))
-
+ 
     first_three = [
         event for event in events
         if isinstance(event, dict)
@@ -93,11 +98,11 @@ def heuristic_evaluate(candidate: dict) -> dict:
         and _number(event.get("end"), float("-inf")) > last_five_start
         and _number(event.get("start"), float("inf")) < segment_end
     ]
-
+ 
     hook_text = _event_text(first_three)
     ending_text = _event_text(last_five)
     transcript = str(candidate.get("transcript") or _event_text(events))
-
+ 
     hook_score = min(10, 3 + 1.5 * _hits(hook_text, HOOK_TERMS)
                      + (2 if first_three else 0))
     cliffhanger_score = min(
@@ -119,7 +124,7 @@ def heuristic_evaluate(candidate: dict) -> dict:
         10,
         4 + (2 if events else 0) + (2 if duration >= 25 else 0),
     )
-
+ 
     scores = {
         "hook": round(hook_score, 1),
         "cliffhanger": round(cliffhanger_score, 1),
@@ -131,7 +136,7 @@ def heuristic_evaluate(candidate: dict) -> dict:
         sum(scores[key] * WEIGHTS[key] for key in WEIGHTS),
         2,
     )
-
+ 
     return {
         "scores": scores,
         "total_score": total_score,
@@ -143,16 +148,16 @@ def heuristic_evaluate(candidate: dict) -> dict:
         ),
         "risk_flags": ["Heuristic scores may overrate keyword matches."],
     }
-
-
+ 
+ 
 def _normalize_llm_result(result: dict, model: str) -> dict:
     if not isinstance(result, dict):
         raise ValueError("LLM response must be a JSON object.")
-
+ 
     raw_scores = result.get("scores")
     if not isinstance(raw_scores, dict):
         raise ValueError("LLM response is missing a scores object.")
-
+ 
     scores = {}
     for key in WEIGHTS:
         try:
@@ -162,11 +167,11 @@ def _normalize_llm_result(result: dict, model: str) -> dict:
         if not 0 <= score <= 10:
             raise ValueError(f"LLM {key} score must be between 0 and 10.")
         scores[key] = score
-
+ 
     risk_flags = result.get("risk_flags", [])
     if not isinstance(risk_flags, list):
         risk_flags = [str(risk_flags)]
-
+ 
     normalized = dict(result)
     normalized.update({
         "scores": scores,
@@ -181,19 +186,19 @@ def _normalize_llm_result(result: dict, model: str) -> dict:
         "risk_flags": [str(flag) for flag in risk_flags],
     })
     return normalized
-
-
+ 
+ 
 def llm_evaluate(candidate: dict, model: str | None = None) -> dict:
     """Evaluate one candidate through Groq's Chat Completions API."""
     api_key = _config_value("GROQ_API_KEY")
     if not api_key:
         raise RuntimeError("GROQ_API_KEY is not configured.")
-
+ 
     try:
         from groq import Groq
     except ImportError as exc:
         raise RuntimeError("Install the optional groq package with `pip install groq`.") from exc
-
+ 
     model = model or _config_value("GROQ_MODEL", "openai/gpt-oss-20b")
     prompt = f"""Evaluate this screenplay excerpt as a standalone social-media promo.
 Only use evidence in the excerpt. Do not invent events or dialogue.
@@ -209,7 +214,7 @@ Clip: {candidate.get('segments', [])}
 Transcript:
 {str(candidate.get('transcript', ''))[:12000]}
 """
-
+ 
     response = Groq(
         api_key=api_key,
         timeout=30.0,
@@ -223,15 +228,15 @@ Transcript:
     content = response.choices[0].message.content
     if not content:
         raise ValueError("Groq returned an empty response.")
-
+ 
     return _normalize_llm_result(json.loads(content), model)
-
-
+ 
+ 
 def evaluate(candidate: dict, use_llm: bool = False) -> dict:
     """Evaluate a candidate; use Groq when requested, falling back to heuristic."""
     if not isinstance(candidate, dict):
         raise TypeError("Candidate must be a dictionary.")
-
+ 
     if use_llm:
         try:
             return llm_evaluate(candidate)
@@ -242,5 +247,6 @@ def evaluate(candidate: dict, use_llm: bool = False) -> dict:
             )
             result["evaluation_method"] = "heuristic_fallback"
             return result
-
+ 
     return heuristic_evaluate(candidate)
+ 
