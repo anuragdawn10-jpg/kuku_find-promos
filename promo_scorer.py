@@ -8,9 +8,7 @@ from __future__ import annotations
 import json
 import os
 
-
 def _config_value(name: str, default: str | None = None) -> str | None:
-    """Read configuration from environment variables or Streamlit secrets."""
     value = os.getenv(name)
     if value:
         return value
@@ -19,8 +17,6 @@ def _config_value(name: str, default: str | None = None) -> str | None:
         import streamlit as st
         return st.secrets.get(name, default)
     except Exception:
-        # Streamlit secrets may be unavailable when running locally without a
-        # secrets file, or when this module is used outside the Streamlit app.
         return default
 
 
