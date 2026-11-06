@@ -9,6 +9,21 @@ import json
 import os
 
 
+def _config_value(name: str, default: str | None = None) -> str | None:
+    """Read configuration from environment variables or Streamlit secrets."""
+    value = os.getenv(name)
+    if value:
+        return value
+
+    try:
+        import streamlit as st
+        return st.secrets.get(name, default)
+    except Exception:
+        # Streamlit secrets may be unavailable when running locally without a
+        # secrets file, or when this module is used outside the Streamlit app.
+        return default
+
+
 WEIGHTS = {
     "hook": 0.25,
     "cliffhanger": 0.25,
@@ -175,7 +190,7 @@ def _normalize_llm_result(result: dict, model: str) -> dict:
 
 def llm_evaluate(candidate: dict, model: str | None = None) -> dict:
     """Evaluate a candidate with Groq, when credentials and package exist."""
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = _config_value("GROQ_API_KEY")
     if not api_key:
         raise RuntimeError("GROQ_API_KEY is not configured.")
 
@@ -184,7 +199,7 @@ def llm_evaluate(candidate: dict, model: str | None = None) -> dict:
     except ImportError as exc:
         raise RuntimeError("Install the optional groq package.") from exc
 
-    model = model or os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    model = model or _config_value("GROQ_MODEL", "llama-3.3-70b-versatile")
     prompt = f"""Evaluate this screenplay excerpt as a standalone social-media promo.
 Only use evidence in the excerpt. Do not invent events or dialogue.
 A valid promo is 20–60 seconds, starts with a compelling hook in its first 3 seconds,
