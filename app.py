@@ -1,30 +1,50 @@
 from __future__ import annotations
-
+ 
 import json
 import os
 import tempfile
-
+ 
 import pandas as pd
 import streamlit as st
-
+ 
 from candidate_generator import generate_candidates
 from evaluator import quality_summary
 from parser import parse_zip
+from promo_scorer import groq_configured
 from ranker import rank_candidates
-
-
+ 
+ 
 st.set_page_config(page_title="Kuku Promo Finder", page_icon="🎬", layout="wide")
 st.title("🎬 Kuku Promo Finder")
 st.caption("Screenplay-based promo discovery • 20–60 second clips")
-
+ 
 with st.sidebar:
     st.header("Settings")
-    st.info("Promo scoring uses the local heuristic evaluator. No Groq API calls are made.")
+    key_ok = groq_configured()
+    use_llm = st.checkbox(
+        "Use Groq LLM evaluation",
+        value=False,
+        disabled=not key_ok,
+        help="Runs Groq only on the top heuristic-ranked windows; the rest keep heuristic scores.",
+    )
+    llm_limit = st.slider(
+        "Groq-evaluate top N windows", min_value=1, max_value=20, value=5,
+        disabled=not (use_llm and key_ok),
+    )
+    if not key_ok:
+        st.warning("GROQ_API_KEY not found. Add it to Streamlit secrets or env vars.")
+    elif use_llm:
+        st.caption(
+            "The top windows are sent to Groq. Only use this with text you are "
+            "permitted to share with that service."
+        )
+    else:
+        st.info("Using the local heuristic evaluator only. No Groq calls are made.")
     top_n = st.number_input(
         "Promos to display", min_value=5, max_value=100, value=20, step=5
     )
     st.info("Heuristic scoring is a baseline. Review all suggested clips manually.")
-
+ 
 uploaded = st.file_uploader("Upload the screenplay ZIP", type=["zip"])
 if uploaded:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
@@ -38,13 +58,13 @@ if uploaded:
         col1.metric("Episodes", len(episodes))
         col2.metric("Timestamped events", sum(len(e.events) for e in episodes))
         col3.metric("Episodes with events", sum(bool(e.events) for e in episodes))
-
+ 
         if st.button("Find and rank promos", type="primary"):
             try:
                 with st.spinner("Generating promo windows..."):
                     candidates = generate_candidates(episodes)
                 st.session_state["candidate_count"] = len(candidates)
-
+ 
                 if not candidates:
                     st.warning(
                         "No eligible 20–60 second promo windows were found. "
@@ -53,12 +73,35 @@ if uploaded:
                     )
                     st.session_state.pop("ranked", None)
                 else:
-                    with st.spinner("Scoring and ranking promos..."):
-                        ranked = rank_candidates(
-                            candidates,
-                            use_llm=False,
-                            top_n=int(top_n),
+                    progress = st.progress(0.0, text="Scoring and ranking promos...")
+ 
+                    def _on_progress(done: int, total: int) -> None:
+                        progress.progress(
+                            done / total, text=f"Groq evaluated {done}/{total} windows"
                         )
+ 
+                    ranked = rank_candidates(
+                        candidates,
+                        use_llm=use_llm,
+                        top_n=int(top_n),
+                        llm_limit=int(llm_limit),
+                        progress_callback=_on_progress if use_llm else None,
+                    )
+                    progress.empty()
+                    if use_llm:
+                        failed = [
+                            r for r in ranked
+                            if r["evaluation_method"] == "heuristic_fallback"
+                        ]
+                        ok = sum(r["evaluation_method"].startswith("llm:") for r in ranked)
+                        if failed:
+                            st.warning(
+                                f"Groq failed for {len(failed)} window(s); heuristic "
+                                f"fallback used. First error: "
+                                f"{failed[0]['risk_flags'][-1]}"
+                            )
+                        if ok:
+                            st.success(f"{ok} window(s) scored by Groq.")
                     st.session_state["ranked"] = ranked
                     st.session_state["episodes"] = len(episodes)
                     st.session_state["events"] = sum(len(e.events) for e in episodes)
@@ -71,7 +114,7 @@ if uploaded:
             os.unlink(zip_path)
         except OSError:
             pass
-
+ 
 if "ranked" in st.session_state:
     ranked = st.session_state["ranked"]
     st.subheader("Ranked promo candidates")
@@ -79,7 +122,7 @@ if "ranked" in st.session_state:
         f"{st.session_state.get('candidate_count', len(ranked))} windows generated; "
         f"showing top {len(ranked)}."
     )
-
+ 
     st.json(quality_summary(ranked))
     rows = []
     for promo in ranked:
@@ -93,7 +136,7 @@ if "ranked" in st.session_state:
             "Method": promo["evaluation_method"],
         })
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
-
+ 
     for promo in ranked:
         with st.expander(
             f"#{promo['rank']} • Episode {promo['episode']} • Score {promo['total_score']}"
@@ -109,7 +152,7 @@ if "ranked" in st.session_state:
             st.write(f"**Why it works:** {promo['why_it_works']}")
             st.write("**Scores:**", promo["scores"])
             st.write("**Review flags:**", promo.get("risk_flags", []))
-
+ 
     st.download_button(
         "Download ranked_promos.json",
         json.dumps(ranked, indent=2, ensure_ascii=False),
@@ -128,3 +171,4 @@ else:
         "The app analyzes screenplay text and timestamps. It cannot verify actual "
         "video/audio quality."
     )
+ 
