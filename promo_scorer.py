@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 
+
 def _config_value(name: str, default: str | None = None) -> str | None:
     value = os.getenv(name)
     if value:
@@ -140,9 +141,7 @@ def heuristic_evaluate(candidate: dict) -> dict:
         "why_it_works": (
             "Baseline keyword and structure score; editor review required."
         ),
-        "risk_flags": [
-            "Heuristic scores may overrate keyword matches."
-        ],
+        "risk_flags": ["Heuristic scores may overrate keyword matches."],
     }
 
 
@@ -185,7 +184,7 @@ def _normalize_llm_result(result: dict, model: str) -> dict:
 
 
 def llm_evaluate(candidate: dict, model: str | None = None) -> dict:
-    """Evaluate a candidate with Groq, when credentials and package exist."""
+    """Evaluate one candidate through Groq's Chat Completions API."""
     api_key = _config_value("GROQ_API_KEY")
     if not api_key:
         raise RuntimeError("GROQ_API_KEY is not configured.")
@@ -193,9 +192,9 @@ def llm_evaluate(candidate: dict, model: str | None = None) -> dict:
     try:
         from groq import Groq
     except ImportError as exc:
-        raise RuntimeError("Install the optional groq package.") from exc
+        raise RuntimeError("Install the optional groq package with `pip install groq`.") from exc
 
-    model = model or _config_value("GROQ_MODEL", "llama-3.3-70b-versatile")
+    model = model or _config_value("GROQ_MODEL", "openai/gpt-oss-20b")
     prompt = f"""Evaluate this screenplay excerpt as a standalone social-media promo.
 Only use evidence in the excerpt. Do not invent events or dialogue.
 A valid promo is 20–60 seconds, starts with a compelling hook in its first 3 seconds,
@@ -211,7 +210,11 @@ Transcript:
 {str(candidate.get('transcript', ''))[:12000]}
 """
 
-    response = Groq(api_key=api_key).chat.completions.create(
+    response = Groq(
+        api_key=api_key,
+        timeout=30.0,
+        max_retries=1,
+    ).chat.completions.create(
         model=model,
         temperature=0.1,
         messages=[{"role": "user", "content": prompt}],
@@ -219,13 +222,13 @@ Transcript:
     )
     content = response.choices[0].message.content
     if not content:
-        raise ValueError("LLM returned an empty response.")
+        raise ValueError("Groq returned an empty response.")
 
     return _normalize_llm_result(json.loads(content), model)
 
 
 def evaluate(candidate: dict, use_llm: bool = False) -> dict:
-    """Evaluate a candidate, using the heuristic as a safe fallback."""
+    """Evaluate a candidate; use Groq when requested, falling back to heuristic."""
     if not isinstance(candidate, dict):
         raise TypeError("Candidate must be a dictionary.")
 
@@ -235,7 +238,7 @@ def evaluate(candidate: dict, use_llm: bool = False) -> dict:
         except Exception as exc:
             result = heuristic_evaluate(candidate)
             result["risk_flags"].append(
-                f"LLM unavailable; heuristic fallback used: {exc}"
+                f"Groq unavailable; heuristic fallback used: {type(exc).__name__}: {exc}"
             )
             result["evaluation_method"] = "heuristic_fallback"
             return result
